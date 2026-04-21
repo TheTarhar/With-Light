@@ -249,3 +249,83 @@ Because `quarantine_inactive_organisations()` uses `coalesce(last_activity, crea
 - **Gemini Flash Threshold:** 95%
 - **Status:** COMPLETED WITHOUT QUOTA TRIP
 - **429 encountered:** No
+
+# Deep-Dive Addendum - Hardened Schema Pass
+
+[CRITICAL_FIXES]
+- **CRITICAL: Overseer database access is still too soft at the read layer.**
+  - Live anonymous calls to Overseer-scoped tables returned HTTP 200 with empty data, not a strict unauthorized failure:
+    - `noura_alerts`: 200 / empty
+    - `platform_audit_log`: 200 / empty
+    - `organisations`: 200 / empty
+  - Live anonymous call to `overseer_org_summary()` also returned `[]` with no auth error.
+  - Write RPCs are better hardened: `overseer_set_tier`, `overseer_suspend_org`, and `overseer_extend_trial` now raise `platform_admin_required`.
+  - Verdict: this is still a **critical security bug** under your rule, because a provider-staff or anonymous session should get a hard 401/403 style denial at the DB boundary for Overseer reads, not a silent success with zero rows.
+- Root cause appears to be a dangerous mix of broad grants plus policy dependence:
+  - remote schema grants `ALL` on `organisations`, `profiles`, `noura_alerts`, `platform_admins`, `platform_audit_log`, and `user_roles` to `anon` and `authenticated`
+  - RLS is enabled, but the read-path semantics are fail-soft rather than explicit deny
+  - `overseer_org_summary()` is `SECURITY DEFINER` and granted to `anon` and `authenticated`
+- **JWT integrity for Noura chat function is good.**
+  - `with-light-app/supabase/functions/chat/index.ts` is not merely checking for token presence.
+  - It extracts the bearer token, calls `serviceClient.auth.getUser(jwt)`, rejects invalid/expired tokens with 401, and derives `org_id` server-side from the authenticated profile.
+  - It also validates the provided anon key against `SUPABASE_ANON_KEY`.
+- **State machine gap: quarantined orgs are not blocked from continuing to use authenticated AI/session flows.**
+  - `chat/index.ts` only resolves `org_id` from `profiles`; it does not check `organisations.quarantined_at`, `suspended_at`, `terminated_at`, or `disabled_at` before servicing the request.
+  - `touch_org_last_activity()` actively clears quarantine markers when chat succeeds.
+  - That means a quarantined org can potentially self-unquarantine simply by using chat, which breaks the intended quarantine state machine.
+- **Signup wizard still contains a UX/logic mismatch around slow ABN verification.**
+  - `lookupAbn()` falls back gracefully, but users can sit waiting on a non-trivial network step with no skeleton or staged progress UI.
+  - Any ABR response beyond a couple of seconds will feel stalled.
+- **Overseer accessibility bug cluster:** many action buttons lack descriptive `aria-label`s.
+  - One example is labelled (`Open upgrade drawer for ...`), but most action buttons like tier change, suspend, reactivate, pulse now, delete tenant, refresh, tab switchers, and save notes rely only on visible text/icons.
+  - That is weak for screen readers in a dense admin control plane.
+
+[PERFORMANCE_TUNING]
+- The hardened indexes were applied successfully to remote:
+  - `idx_organisations_quarantine_scan`
+  - `idx_organisations_last_activity`
+  - `idx_profiles_disabled_cleanup`
+- I could verify the index definitions in applied migrations, but I did **not** run live `EXPLAIN ANALYZE` because this environment does not currently expose a direct SQL execution path for ad hoc explain plans.
+- Performance concern still stands for quarantine sweep logic:
+  - `quarantine_inactive_organisations()` filters on `coalesce(last_activity, created_at) < now() - interval '14 days'`
+  - A plain `last_activity` index will not fully optimize that predicate if many rows still have null `last_activity`
+  - Recommendation: either backfill `last_activity` for all orgs and make it operationally non-null, or add an expression index on `coalesce(last_activity, created_at)`.
+- `overseer_org_summary()` may still be heavier than it looks at scale:
+  - lateral owner lookup from `profiles`
+  - aggregate joins on `ai_request_log` and `noura_alerts`
+  - no evidence in this pass of supporting summary indexes for `ai_request_log(org_id, created_at)` or `noura_alerts(org_id, status)`
+- Provisioning stress after hardening:
+  - 20 concurrent anonymous attempts all failed correctly with `not_authenticated`
+  - this confirms the auth boundary, but it does **not** complete the true race test for slug/ABN collisions because no authenticated synthetic test user was available in this environment
+  - recommendation: next pass should run the same 20-way test under a real authenticated onboarding account to confirm unique constraints and duplicate handling under actual insert pressure
+- Worker workflow code suggests likely latency hotspot in note submission UX:
+  - `ShiftNoteForm` does `supabase.auth.getUser()` right before submit, then inserts the note
+  - on slow mobile networks this adds unnecessary round-trip latency before the real write
+  - recommendation: trust existing session state where possible, fall back to `getUser()` only on auth failure, and show a staged submitting state
+- Signup onboarding likely exceeds the 5-second threshold when ABR is degraded:
+  - ABN verification depends on edge function plus upstream ABR availability
+  - current UI shows loading/error states but not a skeleton or optimistic staged transition
+  - recommendation: add a two-step progress UI, such as `Checking ABN format` then `Confirming with ABR`, and if fallback mode is triggered, continue with an explicit background verification banner instead of holding the step hostage
+- WCAG / Liquid Glass concerns:
+  - many surfaces use `bg-white/[0.04]` to `bg-white/[0.06]` with `text-slate-400` or `text-slate-500`
+  - on translucent glass these combinations are very likely to miss WCAG 2.2 contrast minima, especially for 10px to 11px utility text in Overseer cards and labels
+  - focus visibility is also at risk where buttons and inputs use `outline-none` without an obvious compensating strong focus ring in local classes
+
+[PRODUCT_EVOLUTION]
+- Three high-value Noura automations for NDIS compliance reporting:
+  1. Auto-generate participant progress summaries from shift notes across a date range, grouped by goal and support domain.
+  2. Detect missing mandatory documentation patterns, for example repeated support delivery with no matching clinical note, incident follow-up, or expiring compliance docs, then create compliance tasks automatically.
+  3. Draft audit-ready monthly provider reports that combine participant outcomes, incident trends, staff compliance gaps, and service-delivery exceptions into one export for management review.
+- Social Worker daily workflow, code-based assessment:
+  - log in and sign-out paths exist
+  - participant selection and shift-note submission flow exists in `ShiftNoteForm`
+  - session-expiry handling is present and reasonably clear
+  - but I could not execute a full browser-driven workflow here because browser navigation remains policy-blocked in this environment
+- Best next UX lift for social workers:
+  - prefetch assigned participants and cache locally before entering the note form
+  - reduce submit-time auth checks
+  - add clearer success states for clock in/out and note save when network is weak
+- Onboarding friction improvements:
+  1. Add skeleton/progress states around ABN verification.
+  2. Autofill organisation name immediately from ABR/manual-verification result when available, but visually confirm the autofill so it doesn’t feel like a sudden form mutation.
+  3. Remove the post-provision redundant `organisations.update({ abn: cleanAbn })` write when the RPC already persists ABN, because that is an extra network hop and another failure point.
