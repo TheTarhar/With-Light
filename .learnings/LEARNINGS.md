@@ -43,3 +43,25 @@ For future subcontract quotes, first extract scope intensity from tender documen
 - Tags: tender, estimation, pricing, correction
 
 ---
+## [LRN-20260430-001] correction
+
+**Logged**: 2026-04-30T11:00:00Z
+**Priority**: high
+**Status**: pending
+**Area**: backend
+
+### Summary
+Do not derive worker org context for shift notes from `public.workers`; `shift_notes.worker_id` points to `auth.users`, and org context lives on `profiles` / `user_roles`.
+
+### Details
+A null `shift_notes.org_id` backfill migration incorrectly joined `shift_notes.worker_id` to `public.workers.id` and assumed `workers.org_id` existed. In this schema, `public.workers` is a legacy table without `org_id`, while authenticated worker tenancy is resolved via `profiles.user_id -> profiles.org_id` with fallback to `user_roles.user_id -> user_roles.org_id`.
+
+### Suggested Action
+Fix the backfill migration to join through `profiles` first and `user_roles` second, matching `current_user_org_id()` and other org-resolution code paths.
+
+### Metadata
+- Source: user_feedback
+- Related Files: /home/taha/.openclaw/workspace/with-light-app/supabase/migrations/20260430193000_fix_null_org_id.sql
+- Tags: supabase, org_id, shift_notes, profiles, user_roles
+
+---
